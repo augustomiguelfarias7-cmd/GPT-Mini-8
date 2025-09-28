@@ -1,0 +1,604 @@
+# gpt_mini8_with_tokenizer.py
+# GPT-Mini 8 - Arquivo único completo com Tokenizer + Chain-of-Thought ("pensei_por_mais_tempo")
+# Autor: esqueleto gerado para Augusto
+# Ajuste CONFIG no topo antes de rodar.
+
+import os
+import time
+import random
+import logging
+from typing import List, Dict, Any, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+from datasets import load_dataset, concatenate_datasets
+from PIL import Image
+import torchvision.transforms as T
+import numpy as np
+
+# Tokenizer library
+from tokenizers import Tokenizer as HFTokenizer, models, trainers, pre_tokenizers
+
+# Optional sentence-transformers
+try:
+    from sentence_transformers import SentenceTransformer
+    _HAS_SENT = True
+except Exception:
+    _HAS_SENT = False
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("gpt-mini8")
+
+# -----------------------
+# CONFIG - ajuste antes de rodar
+# -----------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+TARGET_TOKENS = 1_000_000       # meta de tokens processados
+BATCH_SIZE = 2                  # ajuste
+MAX_SEQ_LEN = 512
+VOCAB_SIZE = 50_000             # aumentar em infra maior
+EMBED_DIM = 384
+DEPTH = 6
+HEADS = 6
+LR = 3e-4
+EPOCHS = 10
+SAMPLE_LIMIT = 20000            # limite por dataset para amostra (None = todo)
+CHECKPOINT_DIR = "ckpts_tokenizer_model"
+CHECKPOINT_EVERY_TOKENS = 200_000
+SEED = 42
+# -----------------------
+
+random.seed(SEED)
+torch.manual_seed(SEED)
+
+# -----------------------
+# FILEIRAS: 15 fileiras com até 8 datasets cada (IDs do HF Hub; ajuste conforme necessário)
+# Muitos são exemplos/placeholders — revise se algum falhar no load.
+# -----------------------
+FILEIRAS = {
+    "text_news": ["cc_news", "openwebtext", "newsroom", "news_commentary", "common_crawl", "reddit", "blogs", "wikipedia"],
+    "text_books": ["bookcorpus", "bookcorpusopen", "gutenberg", "wikitext,wikitext-103-v1", "pile", "openwebtext2", "realnews", "short_stories"],
+    "text_dialogue": ["daily_dialog", "empathetic_dialogues", "conv_ai_2", "blended_skill_talk", "persona_chat", "multi_woz", "opensubtitles", "ubuntu_dialogs"],
+    "code": ["bigcode/the-stack-dedup", "codeparrot/github-code", "code_search_net", "code_x_glue_cc_code_to_text", "google/code_dataset", "huggingface/CodeParrot", "leetcodedatasets/python", "leetcodedatasets/java"],
+    "reasoning_math": ["gsm8k", "mathqa", "svamp", "aqua_rat", "mmlu", "drop", "proof_dataset", "algebra_dataset"],
+    "qa_knowledge": ["squad", "natural_questions", "trivia_qa", "hotpot_qa", "newsqa", "quoref", "searchqa", "openbookqa"],
+    "images_caption": ["coco,2017", "flickr30k", "conceptual_captions", "cc12m", "sbu_captions", "visual_genome", "coco_captions", "vist"],
+    "images_general": ["imagenet-1k", "openimages", "places365", "voc", "kitti", "celeba", "stanford_cars", "oxford_flowers"],
+    "audio_speech": ["common_voice,all", "librispeech_asr,clean", "tedlium", "voxforge", "speech_commands", "aidatatang", "aishell", "multilingual_speech"],
+    "audio_music": ["musicnet", "gtzan", "nsynth", "maestro", "freesound", "slakh", "audio_set", "music_corpus"],
+    "video_action": ["kinetics", "ucf101", "hmdb51", "moments_in_time", "youtube8m", "something_something_v2", "ava", "youtube_vis"],
+    "multimodal_pairs": ["vqa", "okvqa", "textvqa", "visual_genome", "image_text_pairs", "mmcoco", "multimodal_corpus", "mmbench"],
+    "web_crawl": ["common_crawl", "cc_net", "wikipedia", "openwebtext2", "webtext", "pile", "cc_news", "news_dataset"],
+    "specialized": ["pubmed", "arxiv", "clinical_trials", "patents", "law_corpus", "financial_corpus", "biomed", "chemistry_dataset"],
+    "misc_small": ["tiny_shakespeare", "ag_news", "dbpedia", "yelp_review_full", "imdb", "amazon_reviews_multi", "quotes", "short_dialogs"]
+}
+
+# -----------------------
+# Funções utilitárias para carregar datasets (com try/except e sample)
+# -----------------------
+def try_load_dataset(name: str, split: str = "train", sample_limit: Optional[int] = SAMPLE_LIMIT):
+    """
+    Tenta carregar um dataset do HF Hub. Retorna None se falhar.
+    Suporta ids com vírgula: "repo,config".
+    """
+    try:
+        if "," in name:
+            repo, conf = [p.strip() for p in name.split(",", 1)]
+            ds = load_dataset(repo, conf, split=split)
+        else:
+            ds = load_dataset(name, split=split)
+        if sample_limit and len(ds) > sample_limit:
+            ds = ds.select(range(min(sample_limit, len(ds))))
+        log.info(f"[OK] {name} -> {len(ds)}")
+        return ds
+    except Exception as e:
+        log.warning(f"[FAIL] {name} -> {e}")
+        return None
+
+def build_concatenated_fileira(names: List[str]) -> Optional[Any]:
+    """Concatena até 8 datasets (já amostrados) da fileira."""
+    loaded = []
+    for n in names[:8]:
+        ds = try_load_dataset(n)
+        if ds is not None:
+            loaded.append(ds)
+    if not loaded:
+        return None
+    if len(loaded) == 1:
+        return loaded[0]
+    try:
+        cat = concatenate_datasets(loaded)
+        log.info(f"Concatenado {len(loaded)} datasets")
+        return cat
+    except Exception as e:
+        log.warning(f"concat failed: {e}")
+        return max(loaded, key=lambda d: len(d))
+
+# -----------------------
+# Tokenizer (BPE) - classe completa com salvar/carregar
+# -----------------------
+class RealTokenizer:
+    def __init__(self, vocab_size: int = VOCAB_SIZE, tokenizer_path: Optional[str] = None):
+        self.vocab_size = vocab_size
+        self.tokenizer_path = tokenizer_path or "tokenizer_gpt_mini8.json"
+        if os.path.exists(self.tokenizer_path):
+            try:
+                self.tok = HFTokenizer.from_file(self.tokenizer_path)
+                log.info(f"Tokenizer carregado de {self.tokenizer_path}")
+            except Exception:
+                # recriar
+                self.tok = HFTokenizer(models.BPE(unk_token="[UNK]"))
+                self.tok.pre_tokenizer = pre_tokenizers.Whitespace()
+                self.trainer = trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=["[PAD]","[UNK]","[CLS]","[SEP]"])
+        else:
+            self.tok = HFTokenizer(models.BPE(unk_token="[UNK]"))
+            self.tok.pre_tokenizer = pre_tokenizers.Whitespace()
+            self.trainer = trainers.BpeTrainer(vocab_size=vocab_size, special_tokens=["[PAD]","[UNK]","[CLS]","[SEP]"])
+
+    def train_from_iterator(self, iterator):
+        log.info("Treinando tokenizer (BPE) a partir da iterator...")
+        self.tok.train_from_iterator(iterator, self.trainer)
+        self.save(self.tokenizer_path)
+        log.info(f"Tokenizer treinado e salvo em {self.tokenizer_path}")
+
+    def encode(self, text: str) -> List[int]:
+        if not text:
+            return []
+        enc = self.tok.encode(text if isinstance(text, str) else str(text))
+        return enc.ids
+
+    def decode(self, ids: List[int]) -> str:
+        if not ids:
+            return ""
+        return self.tok.decode(ids)
+
+    def save(self, path: str):
+        try:
+            self.tok.save(path)
+            log.info(f"Tokenizer salvo em {path}")
+        except Exception as e:
+            log.warning(f"Falha ao salvar tokenizer: {e}")
+
+    @classmethod
+    def load(cls, path: str):
+        if os.path.exists(path):
+            t = HFTokenizer.from_file(path)
+            inst = cls(vocab_size=0, tokenizer_path=path)
+            inst.tok = t
+            return inst
+        else:
+            raise FileNotFoundError(path)
+
+# -----------------------
+# FileiraDataset: padroniza itens (texto tokenizado, imagem tensor, audio placeholder)
+# -----------------------
+class FileiraDataset(Dataset):
+    def __init__(self, hf_dataset, tokenizer: RealTokenizer, max_len: int = MAX_SEQ_LEN, transform_image=None):
+        self.ds = hf_dataset
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.transform_image = transform_image or T.Compose([T.Resize((256,256)), T.ToTensor()])
+        self.length = len(hf_dataset)
+
+    def __len__(self):
+        return self.length
+
+    def _extract_text_field(self, item):
+        if isinstance(item, dict):
+            for key in ("text","article","content","sentence","caption","transcript","question","context"):
+                if key in item and isinstance(item[key], str):
+                    return item[key]
+            # fallback to first string field
+            for v in item.values():
+                if isinstance(v, str):
+                    return v
+            return ""
+        elif isinstance(item, str):
+            return item
+        else:
+            return ""
+
+    def __getitem__(self, idx):
+        raw = self.ds[idx]
+        text = self._extract_text_field(raw)
+        tokens = None
+        if text:
+            ids = self.tokenizer.encode(text)[:self.max_len]
+            if len(ids) > 0:
+                tokens = torch.tensor(ids, dtype=torch.long)
+        image = None
+        if isinstance(raw, dict) and ("image" in raw or "img" in raw):
+            img = raw.get("image", raw.get("img"))
+            try:
+                if isinstance(img, np.ndarray):
+                    pil = Image.fromarray(img)
+                else:
+                    pil = img
+                image = self.transform_image(pil)
+            except Exception:
+                image = None
+        audio = raw.get("audio", None) if isinstance(raw, dict) else None
+        return {"text": tokens, "image": image, "audio": audio, "raw": raw}
+
+# -----------------------
+# Transformer base e modelo multimodal compacto
+# -----------------------
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, nhead, dim_ff):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(nn.Linear(d_model, dim_ff), nn.GELU(), nn.Linear(dim_ff, d_model))
+        self.ln2 = nn.LayerNorm(d_model)
+    def forward(self, x):
+        a,_ = self.attn(x,x,x)
+        x = self.ln1(x + a)
+        x = self.ln2(x + self.ff(x))
+        return x
+
+# VQ-VAE discreto (simples)
+class VQVAE(nn.Module):
+    def __init__(self, in_channels=3, hidden=128, latent_c=64, codebook_size=4096):
+        super().__init__()
+        self.enc = nn.Sequential(
+            nn.Conv2d(in_channels, hidden, 4, 2, 1), nn.ReLU(),
+            nn.Conv2d(hidden, hidden*2, 4, 2, 1), nn.ReLU(),
+            nn.Conv2d(hidden*2, latent_c, 3, 1, 1)
+        )
+        self.codebook = nn.Embedding(codebook_size, latent_c)
+        nn.init.normal_(self.codebook.weight, std=0.02)
+        self.dec = nn.Sequential(
+            nn.ConvTranspose2d(latent_c, hidden*2, 3, 1, 1), nn.ReLU(),
+            nn.ConvTranspose2d(hidden*2, hidden, 4, 2, 1), nn.ReLU(),
+            nn.ConvTranspose2d(hidden, in_channels, 4, 2, 1), nn.Sigmoid()
+        )
+
+    def encode(self, x):
+        return self.enc(x)  # (B, C, H', W')
+
+    def quantize(self, z):
+        B,C,H,W = z.shape
+        flat = z.permute(0,2,3,1).contiguous().view(-1, C)  # (B*H*W, C)
+        # compute L2 dist to codebook
+        dists = torch.cdist(flat, self.codebook.weight)  # (N, K)
+        ids = dists.argmin(dim=1)
+        quant = F.embedding(ids, self.codebook.weight).view(B, H, W, C).permute(0,3,1,2).contiguous()
+        return quant, ids.view(B, H, W)
+
+    def decode(self, z_q):
+        return self.dec(z_q)
+
+    def forward(self, x):
+        z = self.encode(x)
+        z_q, ids = self.quantize(z)
+        recon = self.decode(z_q)
+        return recon, z, z_q, ids
+
+# UNet simples (condicionado por embedding)
+class SimpleUNet(nn.Module):
+    def __init__(self, in_channels=64, base=128, cond_dim=EMBED_DIM):
+        super().__init__()
+        self.enc1 = nn.Sequential(nn.Conv2d(in_channels, base, 3, 1, 1), nn.ReLU())
+        self.enc2 = nn.Sequential(nn.Conv2d(base, base*2, 3, 2, 1), nn.ReLU())
+        self.mid = nn.Sequential(nn.Conv2d(base*2, base*2, 3,1,1), nn.ReLU())
+        self.dec2 = nn.Sequential(nn.ConvTranspose2d(base*2, base, 4, 2, 1), nn.ReLU())
+        self.dec1 = nn.Sequential(nn.Conv2d(base, in_channels, 3,1,1))
+        self.cond_proj = nn.Linear(cond_dim, base*2)
+
+    def forward(self, x, t_idx, cond_emb=None):
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        m = self.mid(e2)
+        if cond_emb is not None:
+            p = self.cond_proj(cond_emb).unsqueeze(-1).unsqueeze(-1)
+            m = m + p
+        d2 = self.dec2(m)
+        out = self.dec1(d2 + e1)
+        return out
+
+# Diffusion scheduler simples
+class DiffusionScheduler:
+    def __init__(self, timesteps=200, beta_start=1e-4, beta_end=0.02):
+        self.timesteps = timesteps
+        self.betas = torch.linspace(beta_start, beta_end, timesteps)
+        self.alphas = 1.0 - self.betas
+        self.alpha_cum = torch.cumprod(self.alphas, dim=0)
+
+    def q_sample(self, x_start, t, noise=None):
+        if noise is None:
+            noise = torch.randn_like(x_start)
+        a = self.alpha_cum[t].to(x_start.device)
+        return torch.sqrt(a) * x_start + torch.sqrt(1 - a) * noise
+
+# Modelo principal multimodal compacto
+class GPTMini8Model(nn.Module):
+    def __init__(self, vocab_size=VOCAB_SIZE, d_model=EMBED_DIM, depth=DEPTH, heads=HEADS):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Parameter(torch.randn(1, MAX_SEQ_LEN, d_model))
+        self.blocks = nn.ModuleList([TransformerBlock(d_model, heads, d_model*4) for _ in range(depth)])
+        self.ln = nn.LayerNorm(d_model)
+        self.text_head = nn.Linear(d_model, vocab_size)
+        self.code_head = nn.Linear(d_model, vocab_size)
+        self.reason_head = nn.Linear(d_model, vocab_size)
+        # multimodal modules
+        self.vqvae = VQVAE(in_channels=3, hidden=128, latent_c=64, codebook_size=4096)
+        self.unet = SimpleUNet(in_channels=64, base=128, cond_dim=d_model)
+        self.scheduler = DiffusionScheduler()
+        self.audio_proj = nn.Linear(256, d_model)
+        # reduced video embedding
+        self.video_proj = nn.Linear(16*3*32*32, d_model)
+
+    def encode_tokens(self, token_ids: torch.LongTensor):
+        x = self.tok_emb(token_ids) + self.pos_emb[:, :token_ids.size(1), :]
+        for b in self.blocks:
+            x = b(x)
+        x = self.ln(x)
+        return x
+
+    def text_logits(self, token_ids: torch.LongTensor):
+        x = self.encode_tokens(token_ids)
+        return self.text_head(x)
+
+    def code_logits(self, token_ids: torch.LongTensor):
+        x = self.encode_tokens(token_ids)
+        return self.code_head(x)
+
+    def reason_logits(self, token_ids: torch.LongTensor):
+        x = self.encode_tokens(token_ids)
+        return self.reason_head(x)
+
+    def image_autoencode(self, images: torch.Tensor):
+        recon, z_e, z_q, ids = self.vqvae(images)
+        return recon, z_e, z_q, ids
+
+    def diffusion_predict_noise(self, x_t, t_idx, cond_emb=None):
+        return self.unet(x_t, t_idx, cond_emb)
+
+    def sample_image_from_embedding(self, cond_emb: torch.Tensor, steps: int = 50, device: str = DEVICE):
+        B = cond_emb.size(0)
+        H = 16; W = 16
+        x = torch.randn(B, 64, H, W, device=device)
+        for i in reversed(range(min(steps, self.scheduler.timesteps))):
+            t = i
+            pred_noise = self.unet(x, torch.tensor([t], device=device), cond_emb)
+            alpha = self.scheduler.alpha_cum[i].to(device)
+            if i > 0:
+                noise = torch.randn_like(x)
+            else:
+                noise = torch.zeros_like(x)
+            x = (1.0 / torch.sqrt(self.scheduler.alphas[i].to(device))) * (x - (self.scheduler.betas[i].to(device) / torch.sqrt(1 - alpha)) * pred_noise) + torch.sqrt(self.scheduler.betas[i].to(device)) * noise
+        # decode latent to image space (simple)
+        recon = self.vqvae.decode(x)
+        return recon.clamp(0,1)
+
+# -----------------------
+# Chain-of-Thought com "pensei_por_mais_tempo"
+# -----------------------
+class ChainOfThought:
+    def __init__(self, model: GPTMini8Model, tokenizer: RealTokenizer, memory: Optional[Any] = None, device: str = DEVICE):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.memory = memory
+        self.device = device
+
+    def _greedy_generate(self, input_ids: torch.LongTensor, max_new: int = 32, temp: float = 0.0):
+        self.model.eval()
+        ids = input_ids.clone().to(self.device)
+        with torch.no_grad():
+            for _ in range(max_new):
+                logits = self.model.reason_logits(ids)
+                last = logits[:, -1, :]
+                if temp == 0.0:
+                    nxt = last.argmax(dim=-1, keepdim=True)
+                else:
+                    probs = F.softmax(last / temp, dim=-1)
+                    nxt = torch.multinomial(probs, num_samples=1)
+                ids = torch.cat([ids, nxt], dim=1)
+        return ids
+
+    def _decode_new(self, orig_len: int, ids: torch.LongTensor):
+        new_ids = ids.squeeze(0).tolist()[orig_len:]
+        if not new_ids:
+            return ""
+        return self.tokenizer.decode(new_ids)
+
+    def generate(self, prompt: str, steps: int = 3, tokens_per_step: int = 32, refine: bool = True, pensei_por_mais_tempo: bool = False):
+        start_ids = torch.tensor([self.tokenizer.encode(prompt)], dtype=torch.long)
+        orig = start_ids.size(1)
+        current_ids = start_ids
+        thoughts = []
+        if pensei_por_mais_tempo:
+            tokens_per_step = int(tokens_per_step * 1.8)
+            steps = max(steps, 3)
+        for s in range(steps):
+            gen = self._greedy_generate(current_ids, max_new=tokens_per_step, temp=0.0)
+            thought = self._decode_new(orig, gen)
+            thoughts.append(thought)
+            if self.memory:
+                try:
+                    self.memory.add(thought, {"step": s})
+                except Exception:
+                    pass
+            if refine:
+                critique_prompt = f"{prompt}\nPensamento: {thought}\nCritique e melhore (curto):"
+                critique_ids = torch.tensor([self.tokenizer.encode(critique_prompt)], dtype=torch.long)
+                crit_gen = self._greedy_generate(critique_ids, max_new=max(8, tokens_per_step//4))
+                critique = self._decode_new(critique_ids.size(1), crit_gen)
+                combined = f"{prompt}\nPensamento: {thought}\nCrítica: {critique}\nRefine:"
+                current_ids = torch.tensor([self.tokenizer.encode(combined)], dtype=torch.long)
+                orig = current_ids.size(1)
+            else:
+                prompt = prompt + "\nPensamento: " + thought
+                current_ids = torch.tensor([self.tokenizer.encode(prompt)], dtype=torch.long)
+                orig = current_ids.size(1)
+            if pensei_por_mais_tempo:
+                extra = self._greedy_generate(current_ids, max_new=max(4, tokens_per_step//8))
+                ext_text = self._decode_new(orig, extra)
+                thoughts[-1] += " | ext: " + ext_text
+                current_ids = extra
+                orig = current_ids.size(1)
+        final_prompt = prompt + "\n" + "\n".join([f"Passo {i+1}: {t}" for i,t in enumerate(thoughts)]) + "\nResposta final:"
+        final_ids = torch.tensor([self.tokenizer.encode(final_prompt)], dtype=torch.long)
+        final_gen = self._greedy_generate(final_ids, max_new=128)
+        final = self._decode_new(final_ids.size(1), final_gen)
+        return {"final": final.strip(), "thoughts": thoughts}
+
+# -----------------------
+# Collate para DataLoader
+# -----------------------
+def collate_batch(items: List[Dict[str,Any]]):
+    texts = [it["text"] for it in items if it["text"] is not None]
+    if texts:
+        maxl = max([t.size(0) for t in texts])
+        padded = torch.zeros((len(texts), maxl), dtype=torch.long)
+        for i,t in enumerate(texts):
+            padded[i,:t.size(0)] = t
+    else:
+        padded = None
+    images = [it["image"] for it in items if it["image"] is not None]
+    if images:
+        images = torch.stack(images)
+    else:
+        images = None
+    return {"text": padded, "image": images, "raw": items}
+
+# -----------------------
+# Treino: percorre cada fileira (100% por fileira), conta tokens e pára em TARGET_TOKENS
+# -----------------------
+def train_all(model: GPTMini8Model, fileira_objs: Dict[str, FileiraDataset], tokenizer: RealTokenizer):
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+    loss_fn = nn.CrossEntropyLoss(ignore_index=0)
+    total_tokens = 0
+    next_ckpt = CHECKPOINT_EVERY_TOKENS
+    epoch = 0
+    while epoch < EPOCHS and total_tokens < TARGET_TOKENS:
+        epoch += 1
+        log.info(f"=== EPOCH {epoch}/{EPOCHS} ===")
+        for fname, fd in fileira_objs.items():
+            log.info(f"[FILEIRA] {fname} - itens: {len(fd)}")
+            loader = DataLoader(fd, batch_size=BATCH_SIZE, shuffle=True, collate_fn=lambda x: collate_batch(x))
+            fileira_tokens = 0
+            for batch in loader:
+                if total_tokens >= TARGET_TOKENS:
+                    log.info("Meta de tokens atingida. Encerrando treino.")
+                    return
+                optimizer.zero_grad()
+                loss = None
+                tok_count = 0
+                # texto
+                if batch["text"] is not None:
+                    text = batch["text"].to(DEVICE)
+                    logits = model.text_logits(text)
+                    shift_logits = logits[:, :-1, :].contiguous()
+                    shift_labels = text[:, 1:].contiguous()
+                    l_text = loss_fn(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+                    loss = l_text if loss is None else loss + l_text
+                    tok_count += int(text.numel())
+                # imagem
+                if batch["image"] is not None:
+                    imgs = batch["image"].to(DEVICE)
+                    recon, z_e, z_q, ids = model.image_autoencode(imgs)
+                    l_recon = F.mse_loss(recon, imgs)
+                    loss = l_recon if loss is None else loss + l_recon
+                    # diffusion supervision (teacher)
+                    x0 = z_e.detach()
+                    t_idx = random.randint(0, model.scheduler.timesteps - 1)
+                    noise = torch.randn_like(x0)
+                    x_t = model.scheduler.q_sample(x0, t_idx, noise=noise)
+                    cond_emb = None
+                    if batch["text"] is not None:
+                        try:
+                            cond_emb = model.encode_tokens(batch["text"][:1].to(DEVICE))[:,0,:]
+                        except Exception:
+                            cond_emb = None
+                    pred_noise = model.diffusion_predict_noise(x_t, t_idx, cond_emb)
+                    l_diff = F.mse_loss(pred_noise, noise)
+                    loss = l_diff if loss is None else loss + l_diff
+                    tok_count += int(imgs.numel() // 100)
+                if loss is None:
+                    continue
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                total_tokens += tok_count
+                fileira_tokens += tok_count
+                if total_tokens >= next_ckpt:
+                    ckpt_path = os.path.join(CHECKPOINT_DIR, f"ckpt_tokens_{total_tokens}.pt")
+                    torch.save({"model_state": model.state_dict(), "optimizer": optimizer.state_dict(), "tokens": total_tokens}, ckpt_path)
+                    log.info(f"[CKPT] salvo: {ckpt_path}")
+                    next_ckpt += CHECKPOINT_EVERY_TOKENS
+                # log parcial
+                if total_tokens % 10000 < max(1, tok_count):
+                    log.info(f"[PROG] tokens: {total_tokens}/{TARGET_TOKENS}")
+            log.info(f"Fileira {fname} processou {fileira_tokens} tokens nesta época")
+    # salvar final
+    final_path = os.path.join(CHECKPOINT_DIR, f"final_tokens_{total_tokens}.pt")
+    torch.save({"model_state": model.state_dict(), "tokens": total_tokens}, final_path)
+    log.info(f"Treino final salvo em {final_path}")
+
+# -----------------------
+# Orquestração principal
+# -----------------------
+def main():
+    log.info("Iniciando pipeline GPT-Mini 8 com Tokenizer e Chain-of-Thought")
+    # 1) construir fileiras HF (concat)
+    fileira_hf = {}
+    for name, ds_names in FILEIRAS.items():
+        ds = build_concatenated_fileira(ds_names)
+        if ds is None:
+            log.warning(f"Fileira {name} vazia -> criando fallback pequeno")
+            try:
+                ds = load_dataset("ag_news", split="train").select(range(200))
+            except Exception:
+                ds = None
+        fileira_hf[name] = ds
+    # 2) coletar amostras para treinar tokenizer
+    tokenizer = RealTokenizer(vocab_size=VOCAB_SIZE)
+    sample_texts = []
+    for name, ds in fileira_hf.items():
+        if ds is None: continue
+        limit = min(200, len(ds))
+        for i in range(limit):
+            item = ds[i]
+            # extrair texto heurístico
+            if isinstance(item, dict):
+                for k in ("text","article","content","caption","sentence","question","transcript"):
+                    if k in item and isinstance(item[k], str):
+                        sample_texts.append(item[k])
+                        break
+            elif isinstance(item, str):
+                sample_texts.append(item)
+            if len(sample_texts) >= 3000:
+                break
+        if len(sample_texts) >= 3000:
+            break
+    if not sample_texts:
+        sample_texts = ["Olá mundo", "GPT-Mini 8 treino inicial"]
+    tokenizer.train_from_iterator(sample_texts)
+    # 3) construir FileiraDataset com tokenizer
+    fileira_objs = {}
+    for name, ds in fileira_hf.items():
+        if ds is None:
+            continue
+        fileira_objs[name] = FileiraDataset(ds, tokenizer, max_len=MAX_SEQ_LEN)
+    # 4) inicializar modelo
+    model = GPTMini8Model(vocab_size=VOCAB_SIZE, d_model=EMBED_DIM, depth=DEPTH, heads=HEADS)
+    model.to(DEVICE)
+    # 5) memória opcional
+    memory = None
+    if _HAS_SENT:
+        memory = SentenceTransformer('all-MiniLM-L6-v2')  # para usar se quiser integrar
+    cot = ChainOfThought(model, tokenizer, memory=None, device=DEVICE)
+    # 6) treinar (meta 1M tokens)
+    train_all(model, fileira_objs, tokenizer)
+    log.info("Treino concluído.")
+
+if __name__ == "__main__":
+    main()
